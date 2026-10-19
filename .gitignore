@@ -1,0 +1,8 @@
+.DS_Store
+.idea/
+backend/venv/
+backend/__pycache__/
+*.pyc
+backend/.env
+backend/.env.*
+backend/uploads/
