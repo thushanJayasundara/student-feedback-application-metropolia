@@ -1,10 +1,13 @@
-import tempfile
+import base64
 import hashlib
 import hmac
 import io
 import json
+import mimetypes
 import os
 import secrets
+import string
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,14 +16,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from paddleocr import PaddleOCR
 from bson import Binary, ObjectId
 from pymongo.errors import DuplicateKeyError
+from cryptography.fernet import Fernet
+import pypdfium2 as pdfium
+from starlette.datastructures import UploadFile as FormUploadFile
 try:
     from pypdf import PdfReader
 except ImportError:
@@ -32,7 +36,6 @@ from feedback import grade_image, grade_text
 app = FastAPI(title="Student Feedback System")
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
-app.mount("/files", StaticFiles(directory=UPLOAD_DIR), name="files")
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
 JWT_ALGORITHM = "HS256"
 TOKEN_TTL_SECONDS = 60 * 60 * 24
@@ -45,13 +48,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ocr_engine = PaddleOCR(
-    lang="en",
-    enable_mkldnn=False,
-    use_doc_orientation_classify=False,
-    use_doc_unwarping=False,
-    use_textline_orientation=False,
-)
+ocr_engine = None
+
+
+def get_ocr_engine():
+    global ocr_engine
+    if ocr_engine is None:
+        try:
+            from paddleocr import PaddleOCR
+
+            ocr_engine = PaddleOCR(
+                lang="en",
+                enable_mkldnn=False,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"OCR is unavailable. Check the PaddleOCR installation and Windows application-control policy: {exc}",
+            ) from exc
+    return ocr_engine
 
 
 class SignupRequest(BaseModel):
@@ -60,6 +78,8 @@ class SignupRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     grade: str = Field(default="", max_length=20)
     class_section: str = Field(default="", max_length=20)
+    class_id: str = Field(default="", max_length=40)
+    enrollment_key: str = Field(default="", max_length=40)
     subject: str = Field(default="", max_length=40)
 
 
@@ -137,13 +157,24 @@ async def signup(data: SignupRequest, role: str):
         raise HTTPException(status_code=409, detail="An account with this email already exists")
     grade = data.grade.strip()
     section = data.class_section.strip().upper()
+    class_record = None
     if role == "student":
-        if not await classes.find_one({"grade": grade, "section": section}):
+        class_record = await classes.find_one({"_id": object_id(data.class_id, "class")}) if data.class_id else None
+        enrollment_key = data.enrollment_key.strip().upper()
+        if not class_record or class_record.get("grade") != grade or class_record.get("section") != section:
             raise HTTPException(status_code=400, detail="Choose a Grade and Section created by a teacher")
-    user = {"name": data.name.strip(), "email": email, "password_hash": hash_password(data.password), "role": role, "grade": grade if role == "student" else "", "class_section": section if role == "student" else "", "subject": data.subject.strip(), "created_at": datetime.now(timezone.utc)}
-    result = await users.insert_one(user)
+        if not enrollment_key or not hmac.compare_digest(
+            class_record.get("enrollment_key_hash", ""),
+            enrollment_key_hash(enrollment_key),
+        ):
+            raise HTTPException(status_code=400, detail="Invalid enrollment key for the selected class")
+    user = {"name": data.name.strip(), "email": email, "password_hash": hash_password(data.password), "role": role, "grade": grade if role == "student" else "", "class_section": section if role == "student" else "", "class_id": class_record["_id"] if class_record else None, "teacher_id": class_record["teacher_id"] if class_record else None, "subject": data.subject.strip(), "created_at": datetime.now(timezone.utc)}
+    try:
+        result = await users.insert_one(user)
+    except DuplicateKeyError as exc:
+        raise HTTPException(status_code=409, detail="An account with this email already exists") from exc
     user["_id"] = result.inserted_id
-    return {"token": create_token(user), "user": public_user(user)}
+    return {"message": "Account created successfully. Please log in.", "user": public_user(user)}
 
 
 async def login(data: LoginRequest, role: str):
@@ -179,9 +210,22 @@ def subject_view(item: dict) -> dict:
 @app.on_event("startup")
 async def create_indexes():
     await subjects.create_index([("teacher_id", 1), ("normalized_name", 1)], unique=True, name="teacher_subject_name_unique")
+    await users.create_index("email", unique=True, name="user_email_unique")
+    await classes.create_index([("teacher_id", 1), ("grade", 1), ("section", 1)], unique=True, name="teacher_class_unique")
+    await classes.create_index("enrollment_key_hash", unique=True, sparse=True, name="enrollment_key_unique")
     await assignments.create_index([("teacher_id", 1), ("grade", 1), ("class_section", 1), ("created_at", -1)], name="teacher_assignment_filters")
     await submissions.create_index([("assignment_id", 1), ("student_id", 1)], name="assignment_student_submission")
     await users.create_index([("role", 1), ("grade", 1), ("class_section", 1), ("name", 1)], name="class_student_lookup")
+    async for item in classes.find({"enrollment_key_hash": {"$exists": False}}):
+        await save_enrollment_key(item["_id"])
+    async for student in users.find({"role": "student", "class_id": {"$exists": False}}):
+        matches = await classes.find({"grade": student.get("grade", ""), "section": student.get("class_section", "")}).to_list(length=2)
+        if len(matches) == 1:
+            await users.update_one({"_id": student["_id"]}, {"$set": {"class_id": matches[0]["_id"], "teacher_id": matches[0]["teacher_id"]}})
+    async for assignment in assignments.find({"class_id": {"$exists": False}, "teacher_id": {"$exists": True}}):
+        class_record = await classes.find_one({"teacher_id": assignment["teacher_id"], "grade": assignment.get("grade"), "section": assignment.get("class_section")})
+        if class_record:
+            await assignments.update_one({"_id": assignment["_id"]}, {"$set": {"class_id": class_record["_id"]}})
     async for assignment in assignments.find({"subject_id": {"$exists": False}, "subject": {"$type": "string"}}):
         if not assignment.get("teacher_id"):
             continue
@@ -206,20 +250,121 @@ def iso(value):
 
 
 def assignment_visibility_query(user: dict) -> dict:
+    class_visibility = []
+    if user.get("class_id"):
+        class_visibility.append({"class_id": user["class_id"]})
+    if user.get("teacher_id"):
+        class_visibility.append({"class_id": {"$exists": False}, "teacher_id": user["teacher_id"]})
+    if not class_visibility:
+        return {"_id": {"$in": []}}
     return {
         "grade": user.get("grade", ""),
         "class_section": user.get("class_section", ""),
         "published": True,
-        "$or": [
-            {"assignment_scope": "entire_class"},
-            {"assignment_scope": {"$exists": False}},
-            {"assigned_student_ids": user["_id"]},
+        "$and": [
+            {
+                "$or": class_visibility
+            },
+            {
+                "$or": [
+                    {"assignment_scope": "entire_class"},
+                    {"assignment_scope": {"$exists": False}},
+                    {"assigned_student_ids": user["_id"]},
+                ]
+            },
         ],
     }
 
 
 def class_view(item: dict) -> dict:
     return {"id": str(item["_id"]), "grade": item["grade"], "section": item["section"], "teacher_id": str(item["teacher_id"]) if item.get("teacher_id") else None}
+
+
+def enrollment_cipher() -> Fernet:
+    key = base64.urlsafe_b64encode(hashlib.sha256(JWT_SECRET.encode()).digest())
+    return Fernet(key)
+
+
+def enrollment_key_hash(value: str) -> str:
+    return hmac.new(JWT_SECRET.encode(), value.encode(), hashlib.sha256).hexdigest()
+
+
+def new_enrollment_key() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(12))
+
+
+def teacher_class_view(item: dict) -> dict:
+    return {
+        **class_view(item),
+        "enrollment_key": enrollment_cipher().decrypt(item["enrollment_key_encrypted"]).decode(),
+    }
+
+
+async def save_enrollment_key(class_id: ObjectId) -> None:
+    while True:
+        key = new_enrollment_key()
+        try:
+            result = await classes.update_one(
+                {"_id": class_id, "enrollment_key_hash": {"$exists": False}},
+                {"$set": {
+                    "enrollment_key_hash": enrollment_key_hash(key),
+                    "enrollment_key_encrypted": enrollment_cipher().encrypt(key.encode()).decode(),
+                }},
+            )
+            if result.modified_count:
+                return
+            return
+        except DuplicateKeyError:
+            continue
+
+
+async def owned_class_ids(user: dict, grade: str = "", section: str = "") -> list[ObjectId]:
+    query = {"teacher_id": user["_id"]}
+    if grade:
+        query["grade"] = grade
+    if section:
+        query["section"] = section.upper()
+    return [item["_id"] async for item in classes.find(query, {"_id": 1})]
+
+
+def teacher_students_query(user: dict, class_ids: list[ObjectId]) -> dict:
+    if not class_ids:
+        return {"_id": {"$in": []}}
+    return {
+        "role": "student",
+        "$or": [
+            {"class_id": {"$in": class_ids}},
+            {"teacher_id": user["_id"], "class_id": {"$exists": False}},
+        ],
+    }
+
+
+async def teacher_student_id(student_id: str, user: dict, class_id: ObjectId | None = None) -> ObjectId:
+    student_object_id = object_id(student_id, "student")
+    class_ids = [class_id] if class_id else await owned_class_ids(user)
+    query = teacher_students_query(user, class_ids)
+    query["_id"] = student_object_id
+    if not await users.find_one(query, {"_id": 1}):
+        raise HTTPException(status_code=404, detail="Student not found")
+    return student_object_id
+
+
+async def assignment_student_query(assignment: dict, user: dict) -> dict:
+    class_ids = [assignment["class_id"]] if assignment.get("class_id") else await owned_class_ids(
+        user, assignment.get("grade", ""), assignment.get("class_section", ""),
+    )
+    query = teacher_students_query(user, class_ids)
+    query.update({"grade": assignment.get("grade", ""), "class_section": assignment.get("class_section", "")})
+    return query
+
+
+async def assignment_student_allowed(assignment: dict, student_id: ObjectId, user: dict) -> bool:
+    if assignment.get("assignment_scope") == "selected_students" and student_id not in assignment.get("assigned_student_ids", []):
+        return False
+    query = await assignment_student_query(assignment, user)
+    query["_id"] = student_id
+    return bool(await users.find_one(query, {"_id": 1}))
 
 
 async def teacher_class(grade: str, section: str, user: dict):
@@ -230,7 +375,7 @@ async def teacher_class(grade: str, section: str, user: dict):
 
 
 async def assignment_document(data: AssignmentRequest, user: dict) -> dict:
-    await teacher_class(data.grade, data.class_section, user)
+    class_record = await teacher_class(data.grade, data.class_section, user)
     subject = await subjects.find_one({"_id": object_id(data.subject_id, "subject"), "teacher_id": user["_id"]})
     if not subject:
         raise HTTPException(status_code=400, detail="Choose a subject created by you")
@@ -245,13 +390,14 @@ async def assignment_document(data: AssignmentRequest, user: dict) -> dict:
             "role": "student",
             "grade": data.grade,
             "class_section": data.class_section.upper(),
+            "$or": [{"class_id": class_record["_id"]}, {"teacher_id": user["_id"]}],
         })
         if valid_count != len(set(assigned_student_ids)):
             raise HTTPException(status_code=400, detail="Selected students must belong to the assignment class")
     payload["assigned_student_ids"] = assigned_student_ids
     payload["subject_id"] = subject["_id"]
     payload["class_section"] = data.class_section.upper()
-    return {**payload, "teacher_id": user["_id"], "created_at": datetime.now(timezone.utc)}
+    return {**payload, "class_id": class_record["_id"], "teacher_id": user["_id"], "created_at": datetime.now(timezone.utc)}
 
 
 async def assignment_form(request: Request, user: dict) -> tuple[AssignmentRequest, UploadFile | None]:
@@ -274,7 +420,7 @@ async def assignment_form(request: Request, user: dict) -> tuple[AssignmentReque
         assigned_student_ids=selected_ids,
     )
     assignment_file = form.get("assignment_file")
-    if assignment_file and not isinstance(assignment_file, UploadFile):
+    if assignment_file and not isinstance(assignment_file, FormUploadFile):
         assignment_file = None
     if not data.assignment_content and not data.instructions and not assignment_file:
         raise HTTPException(status_code=422, detail="Add assignment content or upload a file")
@@ -283,9 +429,15 @@ async def assignment_form(request: Request, user: dict) -> tuple[AssignmentReque
         if assignment_file.content_type not in {"application/pdf"} and not (assignment_file.content_type or "").startswith("image/"):
             raise HTTPException(status_code=415, detail="Assignment files must be an image or PDF")
         contents = await assignment_file.read()
+        if not contents:
+            raise HTTPException(status_code=422, detail="The assignment file is empty")
         if len(contents) > 10 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="Assignment files must be 10MB or smaller")
-        document["assignment_file"] = {"filename": assignment_file.filename, "content_type": assignment_file.content_type, "data": Binary(contents)}
+        document["assignment_file"] = {
+            "filename": Path(assignment_file.filename or "assignment").name,
+            "content_type": assignment_file.content_type,
+            "data": Binary(contents),
+        }
     return data, document
 
 
@@ -296,12 +448,16 @@ def health():
 
 @app.get("/api/classes")
 async def available_classes():
-    result = {}
-    async for item in classes.find({}, {"grade": 1, "section": 1}).sort([("grade", 1), ("section", 1)]):
-        sections = result.setdefault(item["grade"], [])
-        if item["section"] not in sections:
-            sections.append(item["section"])
-    return {"classes": [{"grade": grade, "sections": sections} for grade, sections in result.items()]}
+    result = []
+    async for item in classes.find({}).sort([("grade", 1), ("section", 1)]):
+        teacher = await users.find_one({"_id": item.get("teacher_id")}, {"name": 1})
+        result.append({
+            "id": str(item["_id"]),
+            "grade": item["grade"],
+            "section": item["section"],
+            "teacher_name": teacher.get("name", "Teacher") if teacher else "Teacher",
+        })
+    return {"classes": result}
 
 
 @app.post("/api/auth/signup/{role}")
@@ -326,7 +482,7 @@ async def me(user: dict = Depends(current_user)):
 @app.get("/api/teacher/classes")
 async def teacher_classes(user: dict = Depends(current_user)):
     await require_role(user, "teacher")
-    return {"classes": [class_view(item) async for item in classes.find({"teacher_id": user["_id"]}).sort([("grade", 1), ("section", 1)])]}
+    return {"classes": [teacher_class_view(item) async for item in classes.find({"teacher_id": user["_id"]}).sort([("grade", 1), ("section", 1)])]}
 
 
 @app.post("/api/teacher/classes")
@@ -334,12 +490,31 @@ async def create_teacher_class(data: ClassRequest, user: dict = Depends(current_
     await require_role(user, "teacher")
     grade = data.grade.strip()
     section = data.section.strip().upper()
-    if await classes.find_one({"grade": grade, "section": section, "teacher_id": user["_id"]}):
-        raise HTTPException(status_code=409, detail="This class already exists")
-    item = {"grade": grade, "section": section, "teacher_id": user["_id"], "created_at": datetime.now(timezone.utc)}
-    result = await classes.insert_one(item)
+    if grade not in {str(value) for value in range(1, 11)}:
+        raise HTTPException(status_code=422, detail="Grade must be a number from 1 to 10")
+    if section not in {"A", "B", "C"} or len(data.section.strip()) != 1:
+        raise HTTPException(status_code=422, detail="Section must be A, B, or C")
+    item = None
+    while item is None:
+        key = new_enrollment_key()
+        candidate = {
+            "grade": grade,
+            "section": section,
+            "teacher_id": user["_id"],
+            "enrollment_key_hash": enrollment_key_hash(key),
+            "enrollment_key_encrypted": enrollment_cipher().encrypt(key.encode()).decode(),
+            "created_at": datetime.now(timezone.utc),
+        }
+        try:
+            result = await classes.insert_one(candidate)
+            item = candidate
+            item["_id"] = result.inserted_id
+            item["enrollment_key"] = key
+        except DuplicateKeyError:
+            if await classes.find_one({"teacher_id": user["_id"], "grade": grade, "section": section}):
+                raise HTTPException(status_code=409, detail="This class already exists")
     item["_id"] = result.inserted_id
-    return class_view(item)
+    return {**class_view(item), "enrollment_key": item["enrollment_key"]}
 
 
 @app.delete("/api/teacher/classes/{class_id}")
@@ -348,9 +523,15 @@ async def delete_teacher_class(class_id: str, user: dict = Depends(current_user)
     item = await classes.find_one({"_id": object_id(class_id, "class"), "teacher_id": user["_id"]})
     if not item:
         raise HTTPException(status_code=404, detail="Class not found")
-    if await users.find_one({"role": "student", "grade": item["grade"], "class_section": item["section"]}):
+    if await users.find_one({"role": "student", "$or": [
+        {"class_id": item["_id"]},
+        {"teacher_id": user["_id"], "grade": item["grade"], "class_section": item["section"]},
+    ]}):
         raise HTTPException(status_code=409, detail="Move or remove students before deleting this class")
-    if await assignments.find_one({"teacher_id": user["_id"], "grade": item["grade"], "class_section": item["section"]}):
+    if await assignments.find_one({"teacher_id": user["_id"], "$or": [
+        {"class_id": item["_id"]},
+        {"grade": item["grade"], "class_section": item["section"]},
+    ]}):
         raise HTTPException(status_code=409, detail="Delete assignments for this class before deleting it")
     await classes.delete_one({"_id": item["_id"]})
     return {"id": class_id}
@@ -419,6 +600,8 @@ async def student_uploads(user: dict = Depends(current_user)):
         uploads.append({
             "id": str(item["_id"]),
             "filename": item.get("filename", "Untitled upload"),
+            "uploaded_file": f"/api/files/{Path(item['uploaded_file']).name}" if item.get("uploaded_file") else None,
+            "text": item.get("text", ""),
             "is_correct": grading.get("is_correct"),
             "question": grading.get("question", "Question unavailable"),
             "answer": grading.get("answer", "Answer unavailable"),
@@ -430,13 +613,15 @@ async def student_uploads(user: dict = Depends(current_user)):
 
 @app.get("/api/teacher/dashboard")
 async def teacher_dashboard(user: dict = Depends(current_user)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher access required")
-    students = await users.count_documents({"role": "student"})
-    uploads = await ocr_results.count_documents({})
-    correct = await ocr_results.count_documents({"grading.is_correct": True})
+    await require_role(user, "teacher")
+    class_ids = await owned_class_ids(user)
+    student_query = teacher_students_query(user, class_ids)
+    student_ids = [student["_id"] async for student in users.find(student_query, {"_id": 1}).sort("name", 1)]
+    students = len(student_ids)
+    uploads = await ocr_results.count_documents({"user_id": {"$in": student_ids}}) if student_ids else 0
+    correct = await ocr_results.count_documents({"user_id": {"$in": student_ids}, "grading.is_correct": True}) if student_ids else 0
     student_list = []
-    student_cursor = users.find({"role": "student"}).sort("name", 1)
+    student_cursor = users.find(student_query).sort("name", 1)
     async for student in student_cursor:
         student_uploads = await ocr_results.count_documents({"user_id": student["_id"]})
         student_list.append({"id": str(student["_id"]), "name": student["name"], "email": student["email"], "uploads": student_uploads})
@@ -445,12 +630,8 @@ async def teacher_dashboard(user: dict = Depends(current_user)):
 
 @app.get("/api/teacher/students/{student_id}")
 async def teacher_student_detail(student_id: str, user: dict = Depends(current_user)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher access required")
-    try:
-        student_object_id = ObjectId(student_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid student id") from exc
+    await require_role(user, "teacher")
+    student_object_id = await teacher_student_id(student_id, user)
     student = await users.find_one({"_id": student_object_id, "role": "student"})
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
@@ -462,23 +643,13 @@ async def teacher_student_detail(student_id: str, user: dict = Depends(current_u
             "id": str(item["_id"]),
             "filename": item.get("filename", "Untitled upload"),
             "text": item.get("text", ""),
+            "uploaded_file": f"/api/files/{Path(item['uploaded_file']).name}" if item.get("uploaded_file") else None,
             "is_correct": grading.get("is_correct"),
-            "score": 100 if grading.get("is_correct") else 0,
+            "score": grading.get("score", 100 if grading.get("is_correct") else 0),
             "feedback": grading.get("feedback", "No feedback yet"),
             "created_at": item.get("created_at").isoformat() if item.get("created_at") else None,
         })
     return {"student": {"id": str(student["_id"]), "name": student["name"], "email": student["email"]}, "uploads": uploads}
-
-
-async def teacher_student(student_id: str):
-    try:
-        student_object_id = ObjectId(student_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid student id") from exc
-    student = await users.find_one({"_id": student_object_id, "role": "student"})
-    if not student:
-        raise HTTPException(status_code=404, detail="Student not found")
-    return student_object_id
 
 
 def upload_response(upload_id, item):
@@ -487,6 +658,7 @@ def upload_response(upload_id, item):
         "id": str(upload_id),
         "filename": item.get("filename", "Untitled upload"),
         "text": item.get("text", ""),
+        "uploaded_file": f"/api/files/{Path(item['uploaded_file']).name}" if item.get("uploaded_file") else None,
         "score": 100 if grading.get("is_correct") else 0,
         "feedback": grading.get("feedback", "No feedback yet"),
         "created_at": item.get("created_at").isoformat() if item.get("created_at") else None,
@@ -495,9 +667,8 @@ def upload_response(upload_id, item):
 
 @app.post("/api/teacher/students/{student_id}/uploads")
 async def teacher_add_upload(student_id: str, data: TeacherUploadRequest, user: dict = Depends(current_user)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher access required")
-    student_object_id = await teacher_student(student_id)
+    await require_role(user, "teacher")
+    student_object_id = await teacher_student_id(student_id, user)
     item = {
         "user_id": student_object_id,
         "filename": data.filename.strip(),
@@ -511,8 +682,7 @@ async def teacher_add_upload(student_id: str, data: TeacherUploadRequest, user: 
 
 @app.patch("/api/teacher/uploads/{upload_id}")
 async def teacher_edit_upload(upload_id: str, data: TeacherUploadRequest, user: dict = Depends(current_user)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher access required")
+    await require_role(user, "teacher")
     try:
         upload_object_id = ObjectId(upload_id)
     except Exception as exc:
@@ -520,7 +690,7 @@ async def teacher_edit_upload(upload_id: str, data: TeacherUploadRequest, user: 
     item = await ocr_results.find_one({"_id": upload_object_id})
     if not item:
         raise HTTPException(status_code=404, detail="Upload not found")
-    await teacher_student(str(item["user_id"]))
+    await teacher_student_id(str(item["user_id"]), user)
     await ocr_results.update_one({"_id": upload_object_id}, {"$set": {
         "filename": data.filename.strip(),
         "text": data.text,
@@ -532,8 +702,7 @@ async def teacher_edit_upload(upload_id: str, data: TeacherUploadRequest, user: 
 
 @app.delete("/api/teacher/uploads/{upload_id}")
 async def teacher_delete_upload(upload_id: str, user: dict = Depends(current_user)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher access required")
+    await require_role(user, "teacher")
     try:
         upload_object_id = ObjectId(upload_id)
     except Exception as exc:
@@ -541,7 +710,7 @@ async def teacher_delete_upload(upload_id: str, user: dict = Depends(current_use
     item = await ocr_results.find_one({"_id": upload_object_id})
     if not item:
         raise HTTPException(status_code=404, detail="Upload not found")
-    await teacher_student(str(item["user_id"]))
+    await teacher_student_id(str(item["user_id"]), user)
     await ocr_results.delete_one({"_id": upload_object_id})
     return {"id": upload_id}
 
@@ -560,17 +729,21 @@ async def upload(file: UploadFile = File(...), user: dict = Depends(current_user
     with tempfile.TemporaryDirectory() as temp_dir:
         image_path = Path(temp_dir) / f"upload{suffix}"
         image_path.write_bytes(contents)
-        results = ocr_engine.predict(str(image_path))
+        results = get_ocr_engine().predict(str(image_path))
         rec_texts = []
         for res in results:
             rec_texts.extend(res.json.get("res", {}).get("rec_texts", []))
 
     text = "\n".join(rec_texts)
     grading = await grade_image(contents, file.content_type or "image/png")
+    stored_name = f"{secrets.token_hex(16)}{Path(file.filename or 'work').suffix.lower()}"
+    (UPLOAD_DIR / stored_name).write_bytes(contents)
 
     doc = {
         "user_id": user["_id"],
         "filename": file.filename,
+        "uploaded_file": f"/files/{stored_name}",
+        "content_type": file.content_type or "image/png",
         "text": text,
         "grading": grading,
         "created_at": datetime.now(timezone.utc),
@@ -580,9 +753,64 @@ async def upload(file: UploadFile = File(...), user: dict = Depends(current_user
     return {
         "id": str(result.inserted_id),
         "filename": file.filename,
+        "uploaded_file": f"/api/files/{stored_name}",
         "text": text,
         "grading": grading,
     }
+
+
+@app.get("/api/files/{filename}")
+async def uploaded_file(filename: str, user: dict = Depends(current_user)):
+    if Path(filename).name != filename:
+        raise HTTPException(status_code=404, detail="File not found")
+    stored_path = f"/files/{filename}"
+    submission = await submissions.find_one({
+        "$or": [
+            {"uploaded_file": stored_path},
+            {"uploaded_files.path": stored_path},
+        ],
+    })
+    record = None
+    if submission:
+        if user["role"] == "student":
+            allowed = submission["student_id"] == user["_id"]
+        elif user["role"] == "teacher":
+            assignment = await assignments.find_one({"_id": submission["assignment_id"], "teacher_id": user["_id"]})
+            allowed = bool(assignment and await assignment_student_allowed(assignment, submission["student_id"], user))
+        else:
+            allowed = False
+        if not allowed:
+            raise HTTPException(status_code=404, detail="File not found")
+        record = next((item for item in submission.get("uploaded_files", []) if item.get("path") == stored_path), None)
+        record = record or {"filename": submission.get("filename", filename), "content_type": mimetypes.guess_type(filename)[0]}
+    else:
+        legacy_upload = await ocr_results.find_one({"uploaded_file": stored_path})
+        if not legacy_upload:
+            raise HTTPException(status_code=404, detail="File not found")
+        if user["role"] == "student":
+            allowed = legacy_upload["user_id"] == user["_id"]
+        elif user["role"] == "teacher":
+            try:
+                await teacher_student_id(str(legacy_upload["user_id"]), user)
+                allowed = True
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                allowed = False
+        else:
+            allowed = False
+        if not allowed:
+            raise HTTPException(status_code=404, detail="File not found")
+        record = legacy_upload
+    file_path = UPLOAD_DIR / filename
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    content_type = (record or {}).get("content_type") or mimetypes.guess_type((record or {}).get("filename", filename))[0] or "application/octet-stream"
+    return Response(
+        content=file_path.read_bytes(),
+        media_type=content_type,
+        headers={"Content-Disposition": f'inline; filename="{Path((record or {}).get("filename", filename)).name}"'},
+    )
 
 
 async def assignment_view(item: dict, submission: dict | None = None, teacher_name: str = "") -> dict:
@@ -606,11 +834,28 @@ async def assignment_view(item: dict, submission: dict | None = None, teacher_na
 
 
 def submission_view(item: dict) -> dict:
+    uploaded_files = item.get("uploaded_files")
+    if uploaded_files is None and item.get("uploaded_file"):
+        uploaded_files = [{
+            "path": item["uploaded_file"],
+            "filename": item.get("filename", "Submitted work"),
+            "content_type": mimetypes.guess_type(item.get("filename", ""))[0] or "application/octet-stream",
+        }]
     return {
         "id": str(item["_id"]), "assignment_id": str(item["assignment_id"]), "student_id": str(item["student_id"]),
         "uploaded_file": item.get("uploaded_file"), "filename": item.get("filename"), "submitted_at": iso(item.get("submitted_at")),
         "status": item.get("status", "SUBMITTED"), "ocr_text": item.get("ocr_text", ""), "ai_score": item.get("ai_score"),
         "ai_feedback": item.get("ai_feedback", ""), "teacher_feedback": item.get("teacher_feedback", ""),
+        "submission_text": item.get("submission_text", ""),
+        "submission_method": item.get("submission_method", "upload" if uploaded_files else "typed"),
+        "uploaded_files": [
+            {
+                "filename": uploaded_file.get("filename", "Submitted work"),
+                "content_type": uploaded_file.get("content_type", "application/octet-stream"),
+                "url": f"/api/files/{Path(uploaded_file['path']).name}" if uploaded_file.get("path") else None,
+            }
+            for uploaded_file in uploaded_files or []
+        ],
         "grading": item.get("grading", {}),
         "feedback_status": item.get("feedback_status", "PENDING_REVIEW"),
     }
@@ -688,7 +933,12 @@ async def student_submissions(user: dict = Depends(current_user)):
 
 @app.get("/api/assignments/{assignment_id}/file")
 async def assignment_file(assignment_id: str, user: dict = Depends(current_user)):
-    assignment = await assignments.find_one({"_id": object_id(assignment_id, "assignment"), **assignment_visibility_query(user)})
+    assignment_object_id = object_id(assignment_id, "assignment")
+    if user["role"] == "teacher":
+        assignment = await assignments.find_one({"_id": assignment_object_id, "teacher_id": user["_id"]})
+    else:
+        await require_role(user, "student")
+        assignment = await assignments.find_one({"_id": assignment_object_id, **assignment_visibility_query(user)})
     if not assignment or not assignment.get("assignment_file"):
         raise HTTPException(status_code=404, detail="Assignment file not found")
     stored_file = assignment["assignment_file"]
@@ -696,40 +946,92 @@ async def assignment_file(assignment_id: str, user: dict = Depends(current_user)
 
 
 @app.post("/api/student/assignments/{assignment_id}/submit")
-async def student_submit(assignment_id: str, file: UploadFile = File(...), user: dict = Depends(current_user)):
+async def student_submit(
+    assignment_id: str,
+    file: UploadFile | None = File(default=None),
+    files: list[UploadFile] = File(default=[]),
+    answer_text: str = Form(default="", max_length=20_000),
+    user: dict = Depends(current_user),
+):
     await require_role(user, "student")
     query = assignment_visibility_query(user)
     query["_id"] = object_id(assignment_id, "assignment")
     assignment = await assignments.find_one(query)
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found for your class")
-    content_type = file.content_type or ""
-    if not (content_type.startswith("image/") or content_type == "application/pdf"):
-        raise HTTPException(status_code=415, detail="Please upload an image or PDF")
-    contents = await file.read()
-    if len(contents) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Files must be 10MB or smaller")
-    stored_name = f"{secrets.token_hex(16)}{Path(file.filename or 'work').suffix.lower()}"
-    (UPLOAD_DIR / stored_name).write_bytes(contents)
-    text = ""
-    if content_type.startswith("image/"):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            image_path = Path(temp_dir) / stored_name
-            image_path.write_bytes(contents)
-            results = ocr_engine.predict(str(image_path))
-            for result in results:
-                text += "\n".join(result.json.get("res", {}).get("rec_texts", [])) + "\n"
-        grading = await grade_image(contents, content_type, assignment.get("assignment_content", "") or assignment.get("instructions", ""))
+    submitted_files = ([file] if file else []) + files
+    if len(submitted_files) > 10:
+        raise HTTPException(status_code=413, detail="You can submit up to 10 files at a time")
+    answer_text = answer_text.strip()
+    if not answer_text and not submitted_files:
+        raise HTTPException(status_code=422, detail="Type an answer or upload at least one image or PDF")
+    assignment_content = assignment.get("assignment_content", "") or assignment.get("instructions", "")
+    ocr_parts = []
+    image_grading_input = None
+    stored_files = []
+    for uploaded_file in submitted_files:
+        content_type = uploaded_file.content_type or ""
+        if not (content_type.startswith("image/") or content_type == "application/pdf"):
+            raise HTTPException(status_code=415, detail="Please upload image or PDF files only")
+        contents = await uploaded_file.read()
+        if not contents:
+            raise HTTPException(status_code=422, detail=f"{uploaded_file.filename or 'A file'} is empty")
+        if len(contents) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Files must be 10MB or smaller")
+        original_name = Path(uploaded_file.filename or "work").name
+        stored_name = f"{secrets.token_hex(16)}{Path(original_name).suffix.lower()}"
+        stored_files.append({"stored_name": stored_name, "filename": original_name, "content_type": content_type, "data": contents})
+        if content_type.startswith("image/"):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                image_path = Path(temp_dir) / stored_name
+                image_path.write_bytes(contents)
+                results = get_ocr_engine().predict(str(image_path))
+                for result in results:
+                    ocr_parts.extend(result.json.get("res", {}).get("rec_texts", []))
+            if len(submitted_files) == 1 and not answer_text:
+                image_grading_input = (contents, content_type)
+        elif PdfReader:
+            reader = PdfReader(io.BytesIO(contents))
+            if len(reader.pages) > 30:
+                raise HTTPException(status_code=413, detail="PDFs must contain 30 pages or fewer")
+            with pdfium.PdfDocument(contents) as pdf_document:
+                for page_index, page in enumerate(reader.pages):
+                    page_text = page.extract_text() or ""
+                    if page_text.strip():
+                        ocr_parts.append(page_text)
+                        continue
+                    rendered_page = pdf_document[page_index].render(scale=2).to_pil()
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        page_path = Path(temp_dir) / f"page-{page_index}.png"
+                        rendered_page.save(page_path, format="PNG")
+                        results = get_ocr_engine().predict(str(page_path))
+                        for result in results:
+                            ocr_parts.extend(result.json.get("res", {}).get("rec_texts", []))
+    ocr_text = "\n".join(part for part in ocr_parts if part).strip()
+    feedback_text = "\n\n".join(part for part in (answer_text, ocr_text) if part)
+    if image_grading_input:
+        grading = await grade_image(image_grading_input[0], image_grading_input[1], assignment_content)
         score = grading.get("score", 100 if grading.get("is_correct") else 0)
         feedback = grading.get("feedback", "")
     else:
-        if PdfReader:
-            reader = PdfReader(io.BytesIO(contents))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        grading = await grade_text(text, assignment.get("assignment_content", "") or assignment.get("instructions", ""))
+        grading = await grade_text(feedback_text, assignment_content)
         score, feedback = grading["score"], grading["feedback"]
+    for uploaded_file in stored_files:
+        (UPLOAD_DIR / uploaded_file["stored_name"]).write_bytes(uploaded_file["data"])
     existing = await submissions.find_one({"assignment_id": assignment["_id"], "student_id": user["_id"]})
-    document = {"assignment_id": assignment["_id"], "student_id": user["_id"], "uploaded_file": f"/files/{stored_name}", "filename": file.filename, "submitted_at": datetime.now(timezone.utc), "status": "SUBMITTED", "ocr_text": text.strip(), "ai_score": score, "ai_feedback": feedback, "grading": grading, "teacher_feedback": "", "feedback_status": "PENDING_REVIEW"}
+    file_records = [
+        {"path": f"/files/{uploaded_file['stored_name']}", "filename": uploaded_file["filename"], "content_type": uploaded_file["content_type"]}
+        for uploaded_file in stored_files
+    ]
+    document = {
+        "assignment_id": assignment["_id"], "student_id": user["_id"],
+        "uploaded_file": file_records[0]["path"] if file_records else None,
+        "uploaded_files": file_records,
+        "filename": ", ".join(item["filename"] for item in file_records) or "Typed answer",
+        "submission_text": answer_text, "submission_method": "typed_and_upload" if answer_text and file_records else "typed" if answer_text else "upload",
+        "submitted_at": datetime.now(timezone.utc), "status": "SUBMITTED", "ocr_text": ocr_text,
+        "ai_score": score, "ai_feedback": feedback, "grading": grading, "teacher_feedback": "", "feedback_status": "PENDING_REVIEW",
+    }
     if existing:
         await submissions.replace_one({"_id": existing["_id"]}, document)
         document["_id"] = existing["_id"]
@@ -776,16 +1078,69 @@ async def teacher_assignments(
     if section:
         match["class_section"] = section.upper()
     if student_id:
+        student_object_id = object_id(student_id, "student")
+        class_ids = await owned_class_ids(user, grade, section)
+        if not class_ids:
+            raise HTTPException(status_code=404, detail="Student not found")
+        student_query = teacher_students_query(user, class_ids)
+        student_query["_id"] = student_object_id
+        selected_student = await users.find_one(student_query, {"_id": 1, "class_id": 1, "grade": 1, "class_section": 1})
+        if not selected_student:
+            raise HTTPException(status_code=404, detail="Student not found")
+        match["grade"] = selected_student["grade"]
+        match["class_section"] = selected_student["class_section"]
+        if selected_student.get("class_id"):
+            match["class_id"] = selected_student["class_id"]
         match["$or"] = [
             {"assignment_scope": "entire_class"},
             {"assignment_scope": {"$exists": False}},
-            {"assigned_student_ids": object_id(student_id, "student")},
+            {"assigned_student_ids": student_object_id},
         ]
     pipeline = [
         {"$match": match},
         {"$lookup": {"from": "subjects", "localField": "subject_id", "foreignField": "_id", "as": "assignment_subject"}},
         {"$addFields": {"_subject_name": {"$ifNull": [{"$arrayElemAt": ["$assignment_subject.name", 0]}, "$subject"]}}},
-        {"$lookup": {"from": "submissions", "localField": "_id", "foreignField": "assignment_id", "as": "assignment_submissions"}},
+        {"$lookup": {
+            "from": "users",
+            "let": {
+                "assignment_class_id": "$class_id",
+                "assignment_teacher_id": "$teacher_id",
+                "assignment_grade": "$grade",
+                "assignment_section": "$class_section",
+                "assignment_scope": "$assignment_scope",
+                "assigned_student_ids": "$assigned_student_ids",
+            },
+            "pipeline": [
+                {"$match": {"$expr": {"$and": [
+                    {"$eq": ["$role", "student"]},
+                    {"$or": [
+                        {"$and": [{"$ne": ["$$assignment_class_id", None]}, {"$eq": ["$class_id", "$$assignment_class_id"]}]},
+                        {"$and": [
+                            {"$eq": ["$teacher_id", "$$assignment_teacher_id"]},
+                            {"$eq": ["$grade", "$$assignment_grade"]},
+                            {"$eq": ["$class_section", "$$assignment_section"]},
+                            {"$eq": [{"$ifNull": ["$class_id", None]}, None]},
+                        ]},
+                    ]},
+                    {"$or": [
+                        {"$ne": ["$$assignment_scope", "selected_students"]},
+                        {"$in": ["$_id", {"$ifNull": ["$$assigned_student_ids", []]}]},
+                    ]},
+                ]}}},
+                {"$project": {"_id": 1}},
+            ],
+            "as": "eligible_students",
+        }},
+        {"$lookup": {
+            "from": "submissions",
+            "let": {"assignment_id": "$_id", "student_ids": "$eligible_students._id"},
+            "pipeline": [{"$match": {"$expr": {"$and": [
+                {"$eq": ["$assignment_id", "$$assignment_id"]},
+                {"$in": ["$student_id", "$$student_ids"]},
+            ]}}}],
+            "as": "assignment_submissions",
+        }},
+        {"$project": {"eligible_students": 0}},
         {"$addFields": {"_feedback_status": feedback_status_expr}},
     ]
     if subject:
@@ -826,10 +1181,14 @@ async def teacher_assignment_students(
     ids = [object_id(value, "assignment") for value in assignment_ids.split(",") if value]
     if not ids:
         return {"students": {}}
-    owned_assignments = await assignments.find({"_id": {"$in": ids}, "teacher_id": user["_id"], "grade": grade, "class_section": section.upper()}, {"_id": 1, "assignment_scope": 1, "assigned_student_ids": 1}).to_list(length=len(ids))
+    class_ids = await owned_class_ids(user, grade, section)
+    if not class_ids:
+        return {"students": {}}
+    owned_assignments = await assignments.find({"_id": {"$in": ids}, "teacher_id": user["_id"], "class_id": {"$in": class_ids}, "grade": grade, "class_section": section.upper()}, {"_id": 1, "class_id": 1, "assignment_scope": 1, "assigned_student_ids": 1}).to_list(length=len(ids))
     if not owned_assignments:
         return {"students": {}}
-    student_query = {"role": "student", "grade": grade, "class_section": section.upper()}
+    student_query = teacher_students_query(user, class_ids)
+    student_query.update({"grade": grade, "class_section": section.upper()})
     class_students = await users.find(student_query, {"password_hash": 0}).sort("name", 1).to_list(length=None)
     submissions_list = await submissions.find({"assignment_id": {"$in": [item["_id"] for item in owned_assignments]}, "student_id": {"$in": [student["_id"] for student in class_students]}}).to_list(length=None)
     submission_by_key = {(item["assignment_id"], item["student_id"]): submission_view(item) for item in submissions_list}
@@ -847,11 +1206,11 @@ async def teacher_class_students(grade: str = "", class_section: str = "", subje
     await require_role(user, "teacher")
     if not grade.strip() or not class_section.strip():
         return {"students": []}
-    student_query = {
-        "role": "student",
-        "grade": grade.strip(),
-        "class_section": class_section.strip().upper(),
-    }
+    class_ids = await owned_class_ids(user, grade.strip(), class_section.strip())
+    if not class_ids:
+        return {"students": []}
+    student_query = teacher_students_query(user, class_ids)
+    student_query.update({"grade": grade.strip(), "class_section": class_section.strip().upper()})
     if subject.strip():
         subject_record = await subjects.find_one({"teacher_id": user["_id"], "name": subject.strip()})
         if not subject_record:
@@ -898,7 +1257,7 @@ async def delete_assignment(assignment_id: str, user: dict = Depends(current_use
 async def assignment_tracking(assignment_id: str, user: dict = Depends(current_user)):
     item = await teacher_assignment(assignment_id, user)
     students = []
-    student_query = {"role": "student", "grade": item["grade"], "class_section": item["class_section"]}
+    student_query = await assignment_student_query(item, user)
     if item.get("assignment_scope") == "selected_students":
         student_query["_id"] = {"$in": item.get("assigned_student_ids", [])}
     async for student in users.find(student_query).sort("name", 1):
@@ -913,7 +1272,9 @@ async def review_submission(submission_id: str, data: ReviewRequest, user: dict 
     item = await submissions.find_one({"_id": object_id(submission_id, "submission")})
     if not item:
         raise HTTPException(status_code=404, detail="Submission not found")
-    await teacher_assignment(str(item["assignment_id"]), user)
+    assignment = await teacher_assignment(str(item["assignment_id"]), user)
+    if not await assignment_student_allowed(assignment, item["student_id"], user):
+        raise HTTPException(status_code=404, detail="Submission not found")
     await submissions.update_one({"_id": item["_id"]}, {"$set": {"teacher_feedback": data.teacher_feedback, "feedback_status": data.feedback_status, "status": "REVIEWED" if data.feedback_status == "REVIEWED" else "SUBMITTED"}})
     item.update({"teacher_feedback": data.teacher_feedback, "feedback_status": data.feedback_status, "status": "REVIEWED" if data.feedback_status == "REVIEWED" else "SUBMITTED"})
     return submission_view(item)
@@ -924,8 +1285,25 @@ async def teacher_classroom_dashboard(user: dict = Depends(current_user)):
     await require_role(user, "teacher")
     owned = {"teacher_id": user["_id"]}
     total_assignments = await assignments.count_documents(owned)
-    assignment_ids = [item["_id"] async for item in assignments.find(owned, {"_id": 1})]
-    submitted = await submissions.count_documents({"assignment_id": {"$in": assignment_ids}}) if assignment_ids else 0
-    scores = [item.get("ai_score") for item in await submissions.find({"assignment_id": {"$in": assignment_ids}, "ai_score": {"$ne": None}}).to_list(length=1000)] if assignment_ids else []
-    students = await users.count_documents({"role": "student"})
-    return {"stats": {"students": students, "assignments": total_assignments, "submitted": submitted, "not_submitted": max(students * total_assignments - submitted, 0), "average_score": round(sum(scores) / len(scores)) if scores else 0}}
+    assignment_list = await assignments.find(owned).to_list(length=None)
+    assignment_ids = [item["_id"] for item in assignment_list]
+    class_ids = await owned_class_ids(user)
+    students = await users.count_documents(teacher_students_query(user, class_ids))
+    eligible_count = 0
+    submitted = 0
+    scores = []
+    for assignment in assignment_list:
+        student_query = await assignment_student_query(assignment, user)
+        if assignment.get("assignment_scope") == "selected_students":
+            student_query["_id"] = {"$in": assignment.get("assigned_student_ids", [])}
+        student_ids = [student["_id"] async for student in users.find(student_query, {"_id": 1})]
+        eligible_count += len(student_ids)
+        if not student_ids:
+            continue
+        assignment_submissions = await submissions.find(
+            {"assignment_id": assignment["_id"], "student_id": {"$in": student_ids}},
+            {"ai_score": 1},
+        ).to_list(length=None)
+        submitted += len(assignment_submissions)
+        scores.extend(item["ai_score"] for item in assignment_submissions if isinstance(item.get("ai_score"), (int, float)))
+    return {"stats": {"students": students, "assignments": total_assignments, "submitted": submitted, "not_submitted": max(eligible_count - submitted, 0), "average_score": round(sum(scores) / len(scores)) if scores else 0}}
