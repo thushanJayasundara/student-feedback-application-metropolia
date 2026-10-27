@@ -8,4 +8,6 @@ paddleocr
 python-bidi==0.4.2
 httpx
 PyJWT
+cryptography
 pypdf
+pypdfium2
