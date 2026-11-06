@@ -1,0 +1,3 @@
+export default function FeedbackResult({ grading }) {
+  return <section className="feedback-result"><div className="result-head"><div><p className="eyebrow">FEEDBACK · JUST NOW</p><h2>Your feedback is ready.</h2></div><div className={`score-badge ${grading.is_correct ? 'correct' : 'needs-work'}`}>{grading.is_correct ? 'Good job' : 'Keep going'}</div></div><div className="feedback-columns"><div><p className="eyebrow">QUESTION</p><p>{grading.question}</p></div><div><p className="eyebrow">YOUR ANSWER</p><p>{grading.answer}</p></div><div className="feedback-note"><p className="eyebrow">FEEDBACK</p><p>{grading.feedback}</p></div></div></section>
+}
