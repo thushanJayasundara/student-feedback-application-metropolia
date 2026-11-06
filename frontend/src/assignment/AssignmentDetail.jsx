@@ -1,0 +1,3 @@
+export default function AssignmentDetail({ assignment }) {
+  return <div className="uploaded-assignment-detail"><div className="detail-heading"><div><p className="eyebrow">MY WORK</p><h3>{assignment.filename}</h3></div><span className={`score-badge ${assignment.is_correct ? 'correct' : 'needs-work'}`}>{assignment.is_correct ? 'Good job' : 'Keep going'}</span></div><div className="feedback-columns"><div><p className="eyebrow">QUESTION</p><p>{assignment.question}</p></div><div><p className="eyebrow">YOUR ANSWER</p><p>{assignment.answer}</p></div><div className="feedback-note"><p className="eyebrow">FEEDBACK</p><p>{assignment.feedback}</p></div></div></div>
+}
